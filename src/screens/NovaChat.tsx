@@ -2,6 +2,7 @@ import { ArrowLeft, MoreVertical, Sparkles, Mic, Send, Volume2, VolumeX } from '
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
+import { GoogleGenAI, Type } from "@google/genai";
 
 const LANG_MAP: Record<string, string> = {
   'en': 'en-US',
@@ -241,9 +242,9 @@ export default function NovaChat() {
     setMessages(prev => [...prev, { id: 'typing', text: "...", sender: 'Assistant', isTyping: true }]);
     
     try {
-      const history = messages
+      let history = messages
         .filter(m => !m.isTyping)
-        .slice(-6) // Last 6 messages for context
+        .slice(-8) // Last 8 messages for context
         .map(m => ({
           role: m.sender === 'You' ? 'user' : 'assistant',
           content: m.text
@@ -266,6 +267,7 @@ export default function NovaChat() {
       Language: Respond in the user's detected language.
       Output Format: JSON with "text" (string) and "lang" (ISO code).`;
 
+      // Try DeepSeek (Backend proxy)
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -276,9 +278,13 @@ export default function NovaChat() {
         })
       });
 
-      if (!response.ok) throw new Error('Chat failed');
-
-      const responseData = await response.json();
+      let responseData;
+      if (!response.ok) {
+        console.warn("OpenAI failed, failing over to Gemini...");
+        responseData = await handleGeminiFailover(userMessage, history, systemPrompt);
+      } else {
+        responseData = await response.json();
+      }
       
       const responseText = responseData.text;
       const langCode = responseData.lang || 'en';
@@ -311,6 +317,47 @@ export default function NovaChat() {
       });
       speak(errorText);
     }
+  };
+
+  const handleGeminiFailover = async (message: string, history: any[], systemPrompt: string) => {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error("No Gemini API Key available");
+
+    const ai = new GoogleGenAI({ apiKey });
+    
+    // Gemini history must start with 'user'
+    let geminiHistory = history.map(h => ({
+      role: h.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: h.content }]
+    }));
+
+    // Find first 'user' message
+    const firstUserIndex = geminiHistory.findIndex(h => h.role === 'user');
+    if (firstUserIndex !== -1) {
+      geminiHistory = geminiHistory.slice(firstUserIndex);
+    } else {
+      geminiHistory = [];
+    }
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3-flash-preview",
+      contents: geminiHistory.concat([{ role: 'user', parts: [{ text: message }] }]),
+      config: {
+        systemInstruction: systemPrompt,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            text: { type: Type.STRING },
+            lang: { type: Type.STRING }
+          },
+          required: ["text", "lang"]
+        }
+      }
+    });
+
+    const jsonText = response.text || "{}";
+    return JSON.parse(jsonText);
   };
 
   const toggleSilentMode = () => {

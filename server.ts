@@ -12,9 +12,10 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// Initialize OpenAI
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+// Initialize DeepSeek (OpenAI compatible)
+const deepseek = new OpenAI({
+  baseURL: 'https://api.deepseek.com',
+  apiKey: process.env.DEEPSEEK_API_KEY,
 });
 
 // Initialize ElevenLabs
@@ -24,8 +25,12 @@ const elevenLabs = new ElevenLabsClient({
 
 // API Routes
 app.post("/api/chat", async (req, res) => {
+  const { message, history, systemPrompt } = req.body;
+
   try {
-    const { message, history, systemPrompt } = req.body;
+    if (!process.env.DEEPSEEK_API_KEY) {
+      return res.status(401).json({ error: "DeepSeek Key not configured" });
+    }
 
     const messages = [
       { role: "system", content: systemPrompt || "You are a helpful assistant." },
@@ -33,8 +38,8 @@ app.post("/api/chat", async (req, res) => {
       { role: "user", content: message },
     ];
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o",
+    const response = await deepseek.chat.completions.create({
+      model: "deepseek-chat",
       messages: messages as any,
       response_format: { type: "json_object" },
     });
@@ -42,14 +47,23 @@ app.post("/api/chat", async (req, res) => {
     const content = response.choices[0].message.content;
     res.json(JSON.parse(content || "{}"));
   } catch (error: any) {
-    console.error("OpenAI Error:", error);
-    res.status(500).json({ error: error.message });
+    console.error("DeepSeek Error:", error.message);
+    const status = error.status || 500;
+    res.status(status).json({ 
+      error: error.message,
+      code: error.code,
+      type: error.type 
+    });
   }
 });
 
 app.post("/api/tts", async (req, res) => {
   try {
-    const { text, voiceId = "21m00Tcm4TlvDq8ikWAM" } = req.body; // Default "Rachel" voice
+    const { text, voiceId = "21m00Tcm4TlvDq8ikWAM" } = req.body;
+
+    if (!process.env.ELEVENLABS_API_KEY || process.env.ELEVENLABS_API_KEY.includes("MY_ELEVENLABS")) {
+      return res.status(401).json({ error: "ElevenLabs Key not configured" });
+    }
 
     const audioStream = await elevenLabs.textToSpeech.convert(voiceId, {
       text,
@@ -57,7 +71,6 @@ app.post("/api/tts", async (req, res) => {
       output_format: "mp3_44100_128",
     });
 
-    // Convert stream to buffer
     const chunks: Buffer[] = [];
     for await (const chunk of audioStream) {
       chunks.push(chunk);
@@ -67,8 +80,9 @@ app.post("/api/tts", async (req, res) => {
     res.set("Content-Type", "audio/mpeg");
     res.send(buffer);
   } catch (error: any) {
-    console.error("ElevenLabs Error:", error);
-    res.status(500).json({ error: error.message });
+    console.error("ElevenLabs Error:", error.message);
+    const status = error.status || 503;
+    res.status(status).json({ error: error.message, fallback: true });
   }
 });
 
