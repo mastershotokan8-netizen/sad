@@ -34,7 +34,7 @@ export default function NovaChat() {
   const [lastDetectedLangCode, setLastDetectedLangCode] = useState('en');
   const [speakingText, setSpeakingText] = useState('');
   const [showLangMenu, setShowLangMenu] = useState(false);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const chatRef = useRef<any>(null);
 
   const [messages, setMessages] = useState<{ id: string, text: string, sender: 'Assistant' | 'You', isTyping?: boolean, lang?: string }[]>(() => {
     try {
@@ -147,60 +147,52 @@ export default function NovaChat() {
     }
   };
 
-  const speak = async (text: string, langCode?: string) => {
+  const speak = (text: string, langCode?: string) => {
     if (isSilentMode) return;
     
-    // Stop any existing audio
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
+    // Stop any existing speech
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
     }
 
     try {
       setIsSpeaking(true);
       setSpeakingText(text);
 
-      const response = await fetch('/api/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          text,
-          voiceId: "21m00Tcm4TlvDq8ikWAM" // Default voice, could be customized
-        })
-      });
+      if ('speechSynthesis' in window) {
+        const utterance = new SpeechSynthesisUtterance(text);
+        
+        // Dynamic Voice Selection
+        const currentLangCode = langCode ? (LANG_MAP[langCode] || langCode) : (LANG_MAP[detectedLang] || detectedLang);
+        utterance.lang = currentLangCode;
 
-      if (!response.ok) throw new Error('TTS failed');
+        // Try to find a high quality Google voice for the specific language
+        const availableVoices = window.speechSynthesis.getVoices();
+        const googleVoice = availableVoices.find(v => 
+          v.lang.startsWith(currentLangCode.split('-')[0]) && 
+          (v.name.includes('Google') || v.name.includes('Natural'))
+        );
 
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      audioRef.current = audio;
+        if (googleVoice) {
+          utterance.voice = googleVoice;
+        }
 
-      audio.onended = () => {
-        setIsSpeaking(false);
-        setSpeakingText('');
-        URL.revokeObjectURL(url);
-      };
+        utterance.onend = () => {
+          setIsSpeaking(false);
+          setSpeakingText('');
+        };
 
-      audio.onerror = () => {
-        setIsSpeaking(false);
-        setSpeakingText('');
-        URL.revokeObjectURL(url);
-      };
+        utterance.onerror = () => {
+          setIsSpeaking(false);
+          setSpeakingText('');
+        };
 
-      await audio.play();
+        window.speechSynthesis.speak(utterance);
+      }
     } catch (error) {
       console.error("Speech Error:", error);
       setIsSpeaking(false);
       setSpeakingText('');
-      
-      // Fallback to browser TTS if backend fails
-      if ('speechSynthesis' in window) {
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.lang = langCode ? (LANG_MAP[langCode] || langCode) : (LANG_MAP[detectedLang] || detectedLang);
-        utterance.onend = () => setIsSpeaking(false);
-        window.speechSynthesis.speak(utterance);
-      }
     }
   };
 
@@ -228,27 +220,30 @@ export default function NovaChat() {
     setMessage('');
     
     // Stop existing speech
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
     }
 
-    setMessages(prev => [...prev, { id: Date.now().toString(), text: userMessage, sender: 'You' }]);
+    setMessages(prev => [...prev, { id: Date.now().toString(), text: userMessage, sender: 'You', timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
     
     // Add typing indicator
     setMessages(prev => [...prev, { id: 'typing', text: "...", sender: 'Assistant', isTyping: true }]);
     
     try {
-      let history = messages
+      const history = (messages || [])
         .filter(m => !m.isTyping)
         .slice(-8) // Last 8 messages for context
         .map(m => ({
           role: m.sender === 'You' ? 'user' : 'assistant',
           content: m.text
         }));
+
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        throw new Error("API Key missing or invalid. Please check your Settings > Secrets panel.");
+      }
+
+      const ai = new GoogleGenAI({ apiKey });
 
       let subList = 'None';
       try {
@@ -267,25 +262,30 @@ export default function NovaChat() {
       Language: Respond in the user's detected language.
       Output Format: JSON with "text" (string) and "lang" (ISO code).`;
 
-      // Try DeepSeek (Backend proxy)
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: userMessage,
-          history,
-          systemPrompt
-        })
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: [
+          ...history.map(m => ({
+            role: m.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: m.content }]
+          })),
+          { role: 'user', parts: [{ text: userMessage }] }
+        ],
+        config: {
+          systemInstruction: systemPrompt,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              text: { type: Type.STRING },
+              lang: { type: Type.STRING }
+            },
+            required: ["text", "lang"]
+          }
+        }
       });
 
-      let responseData;
-      if (!response.ok) {
-        console.warn("OpenAI failed, failing over to Gemini...");
-        responseData = await handleGeminiFailover(userMessage, history, systemPrompt);
-      } else {
-        responseData = await response.json();
-      }
-      
+      const responseData = JSON.parse(response.text || "{}");
       const responseText = responseData.text;
       const langCode = responseData.lang || 'en';
       
@@ -300,16 +300,18 @@ export default function NovaChat() {
 
       setMessages(prev => {
         const filtered = prev.filter(m => m.id !== 'typing');
-        return [...filtered, { id: Date.now().toString(), text: responseText, sender: 'Assistant', lang: langCode }];
+        return [...filtered, { id: Date.now().toString(), text: responseText, sender: 'Assistant', lang: langCode, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }];
       });
       
       setTimeout(() => speak(responseText, langCode), 400);
     } catch (error: any) {
       console.error("Chat Error:", error);
       const isQuotaError = error.message?.includes('429');
-      const errorText = isQuotaError 
-        ? "I'm a bit overwhelmed right now! 😅 Can we talk again in a minute?"
-        : "I'm having a connection glitch. Could you try saying that again?";
+      const isAuthError = error.message?.includes('API Key') || error.message?.includes('401') || error.message?.includes('403');
+      
+      let errorText = "I'm having a connection glitch. Could you try saying that again?";
+      if (isQuotaError) errorText = "I'm a bit overwhelmed right now! 😅 Can we talk again in a minute?";
+      if (isAuthError) errorText = "My AI circuits are disconnected! 🔌 (API Key issue detected). Check your Settings > Secrets.";
         
       setMessages(prev => {
         const filtered = prev.filter(m => m.id !== 'typing');
@@ -317,47 +319,6 @@ export default function NovaChat() {
       });
       speak(errorText);
     }
-  };
-
-  const handleGeminiFailover = async (message: string, history: any[], systemPrompt: string) => {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) throw new Error("No Gemini API Key available");
-
-    const ai = new GoogleGenAI({ apiKey });
-    
-    // Gemini history must start with 'user'
-    let geminiHistory = history.map(h => ({
-      role: h.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: h.content }]
-    }));
-
-    // Find first 'user' message
-    const firstUserIndex = geminiHistory.findIndex(h => h.role === 'user');
-    if (firstUserIndex !== -1) {
-      geminiHistory = geminiHistory.slice(firstUserIndex);
-    } else {
-      geminiHistory = [];
-    }
-
-    const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: geminiHistory.concat([{ role: 'user', parts: [{ text: message }] }]),
-      config: {
-        systemInstruction: systemPrompt,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            text: { type: Type.STRING },
-            lang: { type: Type.STRING }
-          },
-          required: ["text", "lang"]
-        }
-      }
-    });
-
-    const jsonText = response.text || "{}";
-    return JSON.parse(jsonText);
   };
 
   const toggleSilentMode = () => {
@@ -535,7 +496,17 @@ export default function NovaChat() {
                     <motion.div animate={{ scale: [1, 1.5, 1], opacity: [0.3, 1, 0.3] }} transition={{ repeat: Infinity, duration: 0.6, delay: 0.4 }} className="w-1 h-1 bg-orange-300 rounded-full" />
                  </div>
               ) : (
-                msg.text
+                <>
+                  {msg.text}
+                  {msg.timestamp && (
+                    <span className={cx(
+                      "text-[9px] font-medium opacity-50 mt-1 self-end",
+                      msg.sender === 'Assistant' ? "text-slate-400" : "text-white/60"
+                    )}>
+                      {msg.timestamp}
+                    </span>
+                  )}
+                </>
               )}
             </div>
             <span className="text-[7px] text-slate-400 font-black uppercase tracking-widest px-2 mt-0.5">
