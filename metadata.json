@@ -1,0 +1,9 @@
+{
+  "name": "Remix: Remix: Remix: Remix: Orbit",
+  "description": "Student wellness AI companion with mood tracking, daily missions, and an anonymous support hub.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ],
+  "majorCapabilities": []
+}
